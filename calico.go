@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"github.com/Microsoft/hcsshim"
 	"github.com/Microsoft/hcsshim/hcn"
+	"github.com/google/gopacket/routing"
 	wapi "github.com/iamacarpet/go-win64api"
 	"io"
 	"net"
@@ -169,6 +170,19 @@ func generateCalicoNetworks(config CalicoConfig) error {
 	createExternalNetwork(config.networkingBackend)
 
 	// TODO: Figure out this Wait-ForManagementIP Shizzle
+	mgmt := waitForManagementIp("External")
+    time.Sleep(10 * time.Second)
+	platform := getPlatformType()
+	if platform == "ec2" || platform == "gce" {
+		err := setMetaDataServerRoute(mgmt)
+		if err != nil {
+			return err
+		}
+	}
+	if config.networkingBackend == "windows-bgp" {
+		_ = wapi.StopService("RemoteAccess")
+		_ = wapi.StartService("RemoteAccess")
+	}
 
 	fmt.Println(good)
 	return nil
@@ -277,3 +291,39 @@ func autoConfigureIpam(it string) string {
 	}
 }
 
+func waitForManagementIp(networkName string) string {
+	var mgmt string
+	for {
+		network, err := hcsshim.GetHNSNetworkByName(networkName)
+		if err != nil {
+			continue
+		}
+		mgmt = network.ManagementIP
+		break
+	}
+	return mgmt
+}
+
+func setMetaDataServerRoute(mgmt string) error {
+	var ip net.IP
+	if ip = net.ParseIP(mgmt); ip == nil {
+		return fmt.Errorf("Not a valid IP.")
+	}
+
+	metaIp := net.ParseIP("169.254.169.254/32")
+
+	router, err := routing.New()
+	if err != nil {
+		return err
+	}
+
+	route, _, preferredSrc, err := router.Route(ip)
+	if err != nil {
+		return err
+	}
+	_, _, _, err = router.RouteWithSrc(route.HardwareAddr, preferredSrc, metaIp)
+	if err != nil {
+		return err
+	}
+	return nil
+}
