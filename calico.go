@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/Microsoft/hcsshim"
-	"github.com/Microsoft/hcsshim/hcn"
 	"github.com/google/gopacket/routing"
 	wapi "github.com/iamacarpet/go-win64api"
 	"io"
@@ -16,7 +15,6 @@ import (
 	"strings"
 	"time"
 )
-
 
 const (
 	cniConf = `{
@@ -171,7 +169,7 @@ func generateCalicoNetworks(config CalicoConfig) error {
 
 	// TODO: Figure out this Wait-ForManagementIP Shizzle
 	mgmt := waitForManagementIp("External")
-    time.Sleep(10 * time.Second)
+	time.Sleep(10 * time.Second)
 	platform := getPlatformType()
 	if platform == "ec2" || platform == "gce" {
 		err := setMetaDataServerRoute(mgmt)
@@ -189,7 +187,7 @@ func generateCalicoNetworks(config CalicoConfig) error {
 }
 
 func checkIfNetworkExists(n string) bool {
-	_, err := hcn.GetNetworkByName(n)
+	_, err := hcsshim.GetHNSNetworkByName(n)
 	if err != nil {
 		return false
 	}
@@ -214,12 +212,12 @@ func createExternalNetwork(backend string) {
 				return
 			}
 
-			network = hcsshim.HNSNetwork {
+			network = hcsshim.HNSNetwork{
 				Type: "Overlay",
 				Name: "External",
 				Subnets: []hcsshim.Subnet{
 					{
-						AddressPrefix: "192.168.255.0/30",
+						AddressPrefix:  "192.168.255.0/30",
 						GatewayAddress: "192.168.255.1",
 						Policies: []json.RawMessage{
 							[]byte("{ Type = \"VSID\", VSID = 9999 }"),
@@ -228,12 +226,12 @@ func createExternalNetwork(backend string) {
 				},
 			}
 		} else {
-			network = hcsshim.HNSNetwork {
+			network = hcsshim.HNSNetwork{
 				Type: "L2Bridge",
 				Name: "External",
 				Subnets: []hcsshim.Subnet{
 					{
-						AddressPrefix: "192.168.255.0/30",
+						AddressPrefix:  "192.168.255.0/30",
 						GatewayAddress: "192.168.255.1",
 					},
 				},
