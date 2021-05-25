@@ -3,13 +3,105 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/Microsoft/hcsshim"
 	"github.com/Microsoft/hcsshim/hcn"
+	wapi "github.com/iamacarpet/go-win64api"
+	"io"
 	"net"
 	"net/http"
-	"os/exec"
+	"os"
+	"path/filepath"
 	"regexp"
+	"strings"
 	"time"
 )
+
+
+const (
+	cniConf = `{
+  "name": "Calico",
+  "windows_use_single_network": true,
+
+  "cniVersion": "0.3.1",
+  "type": "calico",
+  "mode": "__MODE__",
+
+  "vxlan_mac_prefix":  "__MAC_PREFIX__",
+  "vxlan_vni": __VNI__,
+
+  "policy": {
+    "type": "k8s"
+  },
+
+  "log_level": "info",
+
+  "capabilities": {"dns": true},
+
+  "DNS":  {
+    "Nameservers":  [__DNS_NAME_SERVERS__],
+    "Search":  [
+      "svc.cluster.local"
+    ]
+  },
+
+  "nodename_file": "__NODENAME_FILE__",
+
+  "datastore_type": "__DATASTORE_TYPE__",
+
+  "etcd_endpoints": "__ETCD_ENDPOINTS__",
+  "etcd_key_file": "__ETCD_KEY_FILE__",
+  "etcd_cert_file": "__ETCD_CERT_FILE__",
+  "etcd_ca_cert_file": "__ETCD_CA_CERT_FILE__",
+
+  "kubernetes": {
+    "kubeconfig": "__KUBECONFIG__"
+  },
+
+  "ipam": {
+    "type": "__IPAM_TYPE__",
+    "subnet": "usePodCidr"
+  },
+
+  "policies":  [
+    {
+      "Name":  "EndpointPolicy",
+      "Value":  {
+        "Type":  "OutBoundNAT",
+        "ExceptionList":  [
+          "__K8S_SERVICE_CIDR__"
+        ]
+      }
+    },
+    {
+      "Name":  "EndpointPolicy",
+      "Value":  {
+        "Type":  "SDNROUTE",
+        "DestinationPrefix":  "__K8S_SERVICE_CIDR__",
+        "NeedEncap":  true
+      }
+    }
+  ]}
+
+`
+)
+
+func createCniConfg(config CalicoConfig) error {
+	conf := cniConf
+	if config.cni.confDir == "" {
+		return nil
+	}
+	p := filepath.Join(config.cni.confDir, config.cni.confFileName)
+	strings.Replace(string(conf), "__NODENAME_FILE__", config.nodeNameFile, 1)
+	strings.Replace(string(conf), "__KUBECONFIG__", config.kubeConfig, 1)
+	strings.Replace(string(conf), "__K8S_SERVICE_CIDR__", config.serviceCidr, 1)
+	strings.Replace(string(conf), "__DNS_NAME_SERVERS__", config.dnsServers, 1)
+	strings.Replace(string(conf), "__DATASTORE_TYPE__", config.datastoreType, 1)
+	strings.Replace(string(conf), "__IPAM_TYPE__", config.cni.ipamType, 1)
+	strings.Replace(string(conf), "__MODE__", config.networkingBackend, 1)
+	strings.Replace(string(conf), "__VNI__", config.felix.vxlanvni, 1)
+	strings.Replace(string(conf), "__MAC_PREFIX__", config.felix.macPrefix, 1)
+	return os.WriteFile(p, []byte(conf), os.ModePerm)
+}
 
 func deleteAllNetworksOnNodeRestart(backend string) error {
 	backends := map[string]bool{
@@ -18,7 +110,7 @@ func deleteAllNetworksOnNodeRestart(backend string) error {
 	}
 
 	if backends[backend] {
-		networks, err := hcn.ListNetworks()
+		networks, err := hcsshim.HNSListNetworkRequest("GET", "", "")
 		if err != nil {
 			return err
 		}
@@ -26,7 +118,10 @@ func deleteAllNetworksOnNodeRestart(backend string) error {
 		for _, n := range networks {
 			if n.Name != "nat" {
 				// TODO: How to handle making sure it deleted
-				n.Delete()
+				_, err = n.Delete()
+				if err != nil {
+					return err
+				}
 			}
 		}
 	}
@@ -87,60 +182,45 @@ func checkIfNetworkExists(n string) bool {
 	return true
 }
 
-func createFirewallRule() error {
-	args := []string{
-		"New-NetFirewallRule",
-		"-Name OverlayTraffic4789UDP",
-		"-Description \"Overlay network traffic UDP\"",
-		"-Action Allow",
-		"-LocalPort 4789",
-		"-Enabled True",
-		"-DisplayName \"Overlay Traffic 4789 UDP\"",
-		"-Protocol UDP",
-		"-ErrorAction SilentlyContinue\"",
-	}
-	cmd := exec.Command("powershell", args...)
-	return cmd.Run()
-}
-
 func createExternalNetwork(backend string) {
 	for !(checkIfNetworkExists("External")) {
-		var network hcn.HostComputeNetwork
+		var network hcsshim.HNSNetwork
 		if backend == "vxlan" {
-			createFirewallRule()
-			network = hcn.HostComputeNetwork{
-				Type: hcn.Overlay,
+
+			_, err := wapi.FirewallRuleAdd(
+				"OverlayTraffic4789UDP",
+				"Overlay network traffic UDP",
+				"",
+				"4789",
+				wapi.NET_FW_IP_PROTOCOL_UDP,
+				wapi.NET_FW_PROFILE2_ALL,
+			)
+			if err != nil {
+				// TODO: Something better here
+				return
+			}
+
+			network = hcsshim.HNSNetwork {
+				Type: "Overlay",
 				Name: "External",
-				Ipams: []hcn.Ipam{
+				Subnets: []hcsshim.Subnet{
 					{
-						Subnets: []hcn.Subnet{
-							{
-								IpAddressPrefix: "192.168.255.0/30",
-							},
-							{
-								IpAddressPrefix: "192.168.255.1",
-								Policies: []json.RawMessage{
-									[]byte("{ Type = \"VSID\", VSID = 9999 }"),
-								},
-							},
+						AddressPrefix: "192.168.255.0/30",
+						GatewayAddress: "192.168.255.1",
+						Policies: []json.RawMessage{
+							[]byte("{ Type = \"VSID\", VSID = 9999 }"),
 						},
 					},
 				},
 			}
 		} else {
-			network = hcn.HostComputeNetwork{
-				Type: hcn.L2Bridge,
+			network = hcsshim.HNSNetwork {
+				Type: "L2Bridge",
 				Name: "External",
-				Ipams: []hcn.Ipam{
+				Subnets: []hcsshim.Subnet{
 					{
-						Subnets: []hcn.Subnet{
-							{
-								IpAddressPrefix: "192.168.255.0/30",
-							},
-							{
-								IpAddressPrefix: "192.168.255.1",
-							},
-						},
+						AddressPrefix: "192.168.255.0/30",
+						GatewayAddress: "192.168.255.1",
 					},
 				},
 			}
@@ -155,12 +235,12 @@ func createExternalNetwork(backend string) {
 
 func getPlatformType() string {
 	// AKS
-	aksNet, _ := hcn.GetNetworkByName("azure")
+	aksNet, _ := hcsshim.GetHNSNetworkByName("azure")
 	if aksNet != nil {
 		return "aks"
 	}
 
-	eksNet, _ := hcn.GetNetworkByName("vpcbr*")
+	eksNet, _ := hcsshim.GetHNSNetworkByName("vpcbr*")
 	if eksNet != nil {
 		return "eks"
 	}
@@ -168,7 +248,9 @@ func getPlatformType() string {
 	// EC2
 	ec2Resp, _ := http.Get("http://169.254.169.254/latest/meta-data/local-hostname")
 	if ec2Resp != nil {
-		defer ec2Resp.Body.Close()
+		defer func(Body io.ReadCloser) {
+			_ = Body.Close()
+		}(ec2Resp.Body)
 		return "ec2"
 	}
 
@@ -178,7 +260,9 @@ func getPlatformType() string {
 	req.Header.Add("Metadata-Flavor", "Google")
 	gceResp, _ := client.Do(req)
 	if gceResp != nil {
-		defer gceResp.Body.Close()
+		defer func(Body io.ReadCloser) {
+			_ = Body.Close()
+		}(gceResp.Body)
 		return "gce"
 	}
 
@@ -192,3 +276,4 @@ func autoConfigureIpam(it string) string {
 		return "USE_POD_CIDR=false"
 	}
 }
+

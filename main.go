@@ -49,6 +49,7 @@ func main() {
 	}
 
 	// TODO:  Some of this can be pulled from the worker config, need to figure that out
+	// TODO:  Config validation, how do we do it in RKE2
 	calicoCfg := CalicoConfig{
 		hostname:              hostname,
 		kubeNetwork:           "Calico.*",
@@ -75,16 +76,21 @@ func main() {
 		},
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), (5 * time.Minute))
+	ctx, cancel := context.WithTimeout(context.Background(), 5 * time.Minute)
 	defer cancel()
 
-	calicoErr := make(chan error)
-	calicoCmd := exec.CommandContext(ctx, "calico-node.exe")
-	go startCalico(calicoCfg, calicoErr, calicoCmd)
+	err = createCniConfg(calicoCfg)
+    if err != nil {
+    	// Do something
+	}
 
 	felixErr := make(chan error)
 	felixCmd := exec.CommandContext(ctx, "calico-node.exe")
 	go startFelix(calicoCfg, felixErr, felixCmd)
+
+	calicoErr := make(chan error)
+	calicoCmd := exec.CommandContext(ctx, "calico-node.exe")
+	go startCalico(calicoCfg, calicoErr, calicoCmd)
 }
 
 func generateGeneralCalicoEnvs(config CalicoConfig) []string {
@@ -152,8 +158,12 @@ func startCalico(config CalicoConfig, errChan chan error, cmd *exec.Cmd) {
 	cmd.Stderr = nil
 
 	// Lots of setup that has to occur before starting Calico
+    err := generateCalicoNetworks(config)
+    if err != nil {
+    	errChan <- err
+	}
 
 	// TODO: Ensure kubelet has started, if not don't start
-	generateGeneralCalicoEnvs(config)
+	// I guess we wouldn't start calico until after kubelet is running.
 	errChan <- cmd.Run()
 }
